@@ -33,6 +33,24 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	return c.accessToken, nil
 }
 
+// refreshToken forces a re-authentication after a request was rejected with
+// 401 while using stale, then returns a valid token. If another goroutine has
+// already replaced stale (e.g. several concurrent requests hit 401 at once),
+// the freshly cached token is returned without a redundant round-trip, so a
+// burst of 401s triggers a single re-auth rather than one per request.
+func (c *Client) refreshToken(ctx context.Context, stale string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accessToken != "" && c.accessToken != stale && time.Now().Before(c.tokenExpiry) {
+		return c.accessToken, nil
+	}
+	c.accessToken = ""
+	if err := c.authenticate(ctx); err != nil {
+		return "", err
+	}
+	return c.accessToken, nil
+}
+
 // authenticate performs the OAuth2 client-credentials grant and caches the
 // resulting token and its expiry. The caller must hold c.mu.
 func (c *Client) authenticate(ctx context.Context) error {

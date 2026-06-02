@@ -70,14 +70,20 @@ type envelope struct {
 // do performs an authenticated request against an /external/v1 endpoint,
 // unwraps the response envelope, and decodes the inner data into out. A nil
 // reqBody sends no body; a nil out skips response decoding (e.g. DELETE).
+//
+// If the server rejects the cached token with 401 mid-request (the token was
+// revoked or expired between our local expiry check and the server's
+// validation), do refreshes the token once and retries the request exactly
+// once. A second 401 is surfaced to the caller — there is no retry loop.
 func (c *Client) do(ctx context.Context, method, path string, reqBody, out any) error {
-	var body io.Reader
-	if reqBody != nil {
+	hasBody := reqBody != nil
+	var bodyBytes []byte
+	if hasBody {
 		b, err := json.Marshal(reqBody)
 		if err != nil {
 			return err
 		}
-		body = bytes.NewReader(b)
+		bodyBytes = b
 	}
 
 	token, err := c.token(ctx)
@@ -85,30 +91,24 @@ func (c *Client) do(ctx context.Context, method, path string, reqBody, out any) 
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Authorization", "Bearer "+token)
-	if reqBody != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
+	statusCode, data, err := c.attempt(ctx, method, path, bodyBytes, hasBody, token)
 	if err != nil {
 		return err
 	}
 
-	if resp.StatusCode >= http.StatusBadRequest {
-		return parseAPIError(resp.StatusCode, data)
+	if statusCode == http.StatusUnauthorized {
+		fresh, rerr := c.refreshToken(ctx, token)
+		if rerr != nil {
+			return rerr
+		}
+		statusCode, data, err = c.attempt(ctx, method, path, bodyBytes, hasBody, fresh)
+		if err != nil {
+			return err
+		}
+	}
+
+	if statusCode >= http.StatusBadRequest {
+		return parseAPIError(statusCode, data)
 	}
 
 	if out == nil {
@@ -120,12 +120,46 @@ func (c *Client) do(ctx context.Context, method, path string, reqBody, out any) 
 		return err
 	}
 	if env.Status != "" && env.Status != "success" {
-		return &APIError{StatusCode: resp.StatusCode, Status: env.Status, Message: derefStr(env.Message)}
+		return &APIError{StatusCode: statusCode, Status: env.Status, Message: derefStr(env.Message)}
 	}
 	if len(env.Data) == 0 || string(env.Data) == "null" {
 		return nil
 	}
 	return json.Unmarshal(env.Data, out)
+}
+
+// attempt performs a single authenticated HTTP round-trip and returns the
+// response status code and raw body. It is the retryable unit behind do(): the
+// request body is rebuilt from bodyBytes on every call so a retry sends a
+// byte-identical request after the first body reader has been consumed.
+func (c *Client) attempt(ctx context.Context, method, path string, bodyBytes []byte, hasBody bool, token string) (int, []byte, error) {
+	var body io.Reader
+	if hasBody {
+		body = bytes.NewReader(bodyBytes)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if hasBody {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, data, nil
 }
 
 // pageQuery builds the pagination query string. Zero or negative values are
